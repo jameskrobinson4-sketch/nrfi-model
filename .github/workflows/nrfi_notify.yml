@@ -1,0 +1,30 @@
+name: NRFI Daily Picks
+
+on:
+  schedule:
+    - cron: "0 15 * * *"   # 11am ET (UTC-4)
+    - cron: "0 17 * * *"   # 1pm ET
+    - cron: "0 19 * * *"   # 3pm ET
+  workflow_dispatch:         # allows manual trigger from GitHub UI
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run NRFI model and notify
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: python notify_nrfi.py

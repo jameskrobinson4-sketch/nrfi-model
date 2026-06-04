@@ -1,0 +1,9 @@
+.env
+.claude/
+__pycache__/
+*.pyc
+*.pyo
+data/cache/
+output/*.json
+notify.log
+.DS_Store
