@@ -2,14 +2,16 @@ name: NRFI Daily Picks
 
 on:
   schedule:
-    - cron: "0 15 * * *"   # 11am ET (UTC-4)
-    - cron: "0 17 * * *"   # 1pm ET
-    - cron: "0 19 * * *"   # 3pm ET
+    - cron: "0 13 * * *"   # targets 11am ET — scheduled 2hrs early to account for GitHub queue delay
+    - cron: "0 15 * * *"   # targets 1pm ET
+    - cron: "0 17 * * *"   # targets 3pm ET
   workflow_dispatch:         # allows manual trigger from GitHub UI
 
 jobs:
   notify:
     runs-on: ubuntu-latest
+    env:
+      TZ: America/New_York   # fixes datetime.now() returning ET instead of UTC
 
     steps:
       - name: Checkout repo
