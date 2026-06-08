@@ -20,9 +20,11 @@ class MatchupResult:
 
 def score_matchup(game_pk: int, batting_team_side: str,
                   pitcher_hand: str, game_date: date,
+                  team_id: Optional[int] = None,
                   end_date: Optional[date] = None) -> MatchupResult:
     """
     Score the top-3 hitters in the batting lineup against the starter.
+    team_id: used to estimate lineup from roster when battingOrder is not yet posted.
     end_date: if provided, restricts stats to that date (backtest mode).
     Higher score = lineup less likely to score in the first inning.
     """
@@ -34,6 +36,12 @@ def score_matchup(game_pk: int, batting_team_side: str,
     flags = []
     if not confirmed:
         flags.append("lineup_not_confirmed")
+
+    if not batters and team_id:
+        batters = _estimate_top3_from_roster(team_id, season, game_date, end_date)
+        if batters:
+            confirmed = False
+            flags = ["lineup_estimated_from_roster"]
 
     if not batters:
         return MatchupResult(
@@ -157,6 +165,44 @@ def _extract_platoon_stats(data: dict) -> dict:
             pa   = splits[0].get("stat", {}).get("plateAppearances", 0)
             return {**stat, "plateAppearances": pa}
     return {}
+
+
+def _estimate_top3_from_roster(team_id: int, season: int, game_date: date,
+                                end_date) -> list[tuple]:
+    """
+    Estimate the top-3 batters from the active roster when the lineup hasn't posted.
+    Filters out pitchers, fetches season OBP for each position player, returns top 3 by OBP.
+    Caps roster scanning at 20 players to limit API calls.
+    """
+    roster = fetcher.fetch_team_roster(team_id, season, game_date)
+    position_players = [
+        p for p in roster
+        if p.get("position_code", "") not in ("P", "TWP", "")
+    ][:20]
+
+    if not position_players:
+        return []
+
+    ranked = []
+    for p in position_players:
+        pid  = p.get("id")
+        name = p.get("fullName", f"Player {pid}")
+        if not pid:
+            continue
+        stats_data = fetcher.fetch_batter_stats(pid, season, game_date, end_date)
+        obp = _sf(_extract_stat_field(stats_data, "obp"), 0.0)
+        ranked.append((pid, name, obp))
+
+    ranked.sort(key=lambda x: x[2], reverse=True)
+    return [(pid, name) for pid, name, _ in ranked[:3]]
+
+
+def _extract_stat_field(data: dict, field: str):
+    for group in data.get("stats", []):
+        splits = group.get("splits", [])
+        if splits:
+            return splits[0].get("stat", {}).get(field)
+    return None
 
 
 def _sf(val, default):

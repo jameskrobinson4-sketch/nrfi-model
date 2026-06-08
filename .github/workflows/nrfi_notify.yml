@@ -2,10 +2,9 @@ name: NRFI Daily Picks
 
 on:
   schedule:
-    - cron: "0 13 * * *"   # targets 11am ET — scheduled 2hrs early to account for GitHub queue delay
-    - cron: "0 15 * * *"   # targets 1pm ET
-    - cron: "0 17 * * *"   # targets 3pm ET
-  workflow_dispatch:         # allows manual trigger from GitHub UI
+    - cron: "0 14-23 * * *"   # hourly 10am–7pm ET (UTC-4; GitHub often runs ~30min late)
+    - cron: "0 0-4 * * *"     # hourly 8pm–midnight ET
+  workflow_dispatch:            # allows manual trigger from GitHub UI
 
 jobs:
   notify:
@@ -28,6 +27,20 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Set today's date
+        id: date
+        run: echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: Restore daily cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/cache
+            output
+          # Key rotates daily — fresh cache each new day, shared across all hourly runs
+          key: nrfi-daily-${{ steps.date.outputs.date }}
+          restore-keys: nrfi-daily-
 
       - name: Run NRFI model and notify
         env:

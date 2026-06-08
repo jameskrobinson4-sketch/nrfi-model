@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 """
-Run NRFI model and push today's card to ntfy.sh.
-Scheduled at 11am, 1pm, and 3pm ET via cron.
+Run NRFI model and push per-game ntfy notifications as lineups confirm.
 
-Each run clears lineup/umpire cache so fresh data is fetched —
-pitcher and batter stats stay cached since they don't change intraday.
+Runs hourly via GitHub Actions. Each run:
+  - Clears lineup/umpire cache so fresh data is fetched
+  - Re-scores all games
+  - Sends one notification per newly qualifying game (Tier A/B, both lineups confirmed)
+  - Tracks already-notified game_pks in output/{date}_notified.json
+  - Silent run if nothing new to report
 """
 
 import json
+import os
 import subprocess
 import sys
 from datetime import date, datetime
 from pathlib import Path
 
-import os
-
 import requests
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "nrfi-3d5e5fc61cbd")
-NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
-MODEL_DIR = Path(__file__).parent
+NTFY_URL   = f"https://ntfy.sh/{NTFY_TOPIC}"
+MODEL_DIR  = Path(__file__).parent
 
+
+# ── Cache helpers ─────────────────────────────────────────────────────────────
 
 def clear_stale_cache():
-    """Delete lineup and umpire cache so they're re-fetched fresh each run."""
     cache_dir = MODEL_DIR / "data" / "cache" / str(date.today())
     if not cache_dir.exists():
         return 0
@@ -34,6 +37,25 @@ def clear_stale_cache():
             cleared += 1
     return cleared
 
+
+# ── State tracking ────────────────────────────────────────────────────────────
+
+def _state_path() -> Path:
+    return MODEL_DIR / "output" / f"{date.today()}_notified.json"
+
+
+def load_notified() -> set:
+    p = _state_path()
+    if p.exists():
+        return set(json.loads(p.read_text()))
+    return set()
+
+
+def save_notified(notified: set):
+    _state_path().write_text(json.dumps(sorted(notified)))
+
+
+# ── Model runner ──────────────────────────────────────────────────────────────
 
 def run_model() -> bool:
     result = subprocess.run(
@@ -52,110 +74,89 @@ def load_picks() -> dict:
     return json.loads(path.read_text())
 
 
-def lineup_status(pick: dict) -> tuple[bool, bool]:
-    top_ok = pick["top_1st"].get("lineup_confirmed", False)
-    bot_ok = pick["bot_1st"].get("lineup_confirmed", False)
-    return top_ok, bot_ok
+# ── Notification formatting ───────────────────────────────────────────────────
+
+def _hitter_line(hitters: list, team: str) -> str:
+    """Compact last-name + OBP list: 'Torres .408 · McGonigle .398 · Dingler .346'"""
+    parts = []
+    for h in hitters[:3]:
+        last = h["name"].split()[-1]
+        parts.append(f"{last} .{int(round(h['obp'] * 1000)):03d}")
+    return f"{team}: " + " · ".join(parts)
 
 
-def lu_label(top_ok: bool, bot_ok: bool) -> str:
-    if top_ok and bot_ok:
-        return "✓ lineups confirmed"
-    if top_ok:
-        return "⚠ away only — home lineup pending"
-    if bot_ok:
-        return "⚠ home only — away lineup pending"
-    return "⚠ both lineups pending"
+def _pitcher_line(half: dict, side_label: str, opp_team: str) -> str:
+    """'▲ TOP  Keider Montero (RHP)  60/100 · 66 IP  →  61% scoreless'"""
+    pc   = half["pitcher_components"]
+    ip   = pc.get("ip", 0)
+    hand = half["pitcher_hand"]
+    return (
+        f"{side_label}  {half['pitcher']} ({hand}HP)"
+        f"  {half['pitcher_score']:.0f}/100 · {ip:.0f} IP"
+        f"  →  {half['p_scoreless']:.0f}% scoreless"
+    )
 
 
-def format_message(data: dict, run_label: str) -> tuple[str, str, str]:
-    """Returns (title, body, priority string for ntfy)."""
-    if not data:
-        return f"NRFI {run_label} — Error", "Model failed to run today.", "default"
+def format_pick(pick: dict) -> tuple[str, str, str]:
+    """Return (title, body, priority) for a single confirmed qualifying pick."""
+    tier  = pick["tier"]
+    game  = pick["game"]
+    time  = pick["time"]
+    prob  = pick["p_nrfi_pct"]
+    band  = pick["confidence_band"]
+    raw   = pick["raw_score"]
+    top   = pick["top_1st"]
+    bot   = pick["bot_1st"]
+    env   = pick["environment"]["components"]
 
-    today = data.get("date", str(date.today()))
-    picks = data.get("picks", [])
-    total = len(picks)
+    away, home = game.split("@")
+    stake      = "2u" if tier == "A" else "1u"
+    icon       = "★" if tier == "A" else "▸"
 
-    tier_a   = [p for p in picks if p["tier"] == "A"]
-    tier_b   = [p for p in picks if p["tier"] == "B"]
-    playable = tier_a + tier_b
+    title = f"{icon} NRFI Tier {tier} ({stake}) — {game}  {time}"
 
-    confirmed_both  = sum(1 for p in picks if all(lineup_status(p)))
-    pending_picks   = [p for p in picks if not all(lineup_status(p))]
+    ump_name = env.get("umpire_name", "")
+    ump_str  = f"{env.get('umpire', 50):.0f}"
+    if ump_name:
+        ump_str += f" ({ump_name})"
 
-    # ── Title ─────────────────────────────────────────────────────────────────
-    if tier_a and tier_b:
-        play_str = f"{len(tier_a)}A + {len(tier_b)}B"
-    elif tier_a:
-        play_str = f"{len(tier_a)} Tier A"
-    elif tier_b:
-        play_str = f"{len(tier_b)} Tier B"
-    else:
-        play_str = "No plays"
+    wx_flag = next(
+        (f for f in pick.get("flags", []) if "mph" in f or "°F" in f or "%rh" in f),
+        "",
+    )
 
-    title = f"NRFI {run_label}  |  {play_str}  |  {confirmed_both}/{total} lineups in"
-
-    lines = []
-
-    # ── Tier A/B picks ────────────────────────────────────────────────────────
-    for p in playable:
-        top_ok, bot_ok = lineup_status(p)
-        tier_icon = "★" if p["tier"] == "A" else "▸"
-        tier_tag  = "TIER A (2u)" if p["tier"] == "A" else "TIER B (1u)"
-        top = p["top_1st"]
-        bot = p["bot_1st"]
-        env = p["environment"]["components"]
-
-        lines.append(
-            f"{tier_icon} {tier_tag} — {p['game']}  {p['time']}\n"
-            f"  P(NRFI): {p['p_nrfi_pct']}% ±{p['confidence_band']}%\n"
-            f"  {lu_label(top_ok, bot_ok)}\n"
-            f"  TOP: {top['pitcher']} ({top['pitcher_score']:.0f})  {top['p_scoreless']}% scoreless\n"
-            f"  BOT: {bot['pitcher']} ({bot['pitcher_score']:.0f})  {bot['p_scoreless']}% scoreless\n"
-            f"  Park {env.get('park',50):.0f}  Wx {env.get('weather',50):.0f}  Ump {env.get('umpire',50):.0f}"
-        )
-
-    # ── No plays: show top-3 closest skips ───────────────────────────────────
-    if not playable:
-        lines.append("No Tier A or B picks right now.")
-        top_skips = sorted(picks, key=lambda x: x["p_nrfi_pct"], reverse=True)[:3]
-        if top_skips:
-            lines.append("\nClosest to threshold:")
-            for p in top_skips:
-                top_ok, bot_ok = lineup_status(p)
-                lu = "✓" if (top_ok and bot_ok) else "⚠ lineup pending"
-                lines.append(f"  {p['game']}  {p['p_nrfi_pct']}%  [{lu}]")
-
-    # ── Lineup pending summary ────────────────────────────────────────────────
-    lines.append("")
-    if pending_picks:
-        pending_names = "  ".join(p["game"] for p in pending_picks)
-        lines.append(f"⚠ Lineups still pending ({len(pending_picks)}/{total} games):")
-        # Wrap into rows of 4 for readability
-        games = [p["game"] for p in pending_picks]
-        rows = [games[i:i+4] for i in range(0, len(games), 4)]
-        for row in rows:
-            lines.append("  " + "  ".join(row))
-    else:
-        lines.append(f"✓ All {total} lineups confirmed")
-
-    lines.append(f"\n{total} games scored — {run_label} update")
+    lines = [
+        f"P(NRFI): {prob}%  ±{band}%  [raw {raw:.0f}/100]",
+        "",
+        _pitcher_line(top, "▲ TOP", away),
+        f"  {_hitter_line(top.get('hitters', []), away)}",
+        "",
+        _pitcher_line(bot, "▼ BOT", home),
+        f"  {_hitter_line(bot.get('hitters', []), home)}",
+        "",
+        f"Park {env.get('park', 50):.0f}  ·  Wx {env.get('weather', 50):.0f}  ·  Ump {ump_str}",
+    ]
+    if wx_flag:
+        lines.append(f"🌡 {wx_flag}")
+    lines.append("✅ Lineups confirmed")
 
     body     = "\n".join(lines)
-    priority = "high" if tier_a else ("default" if playable else "low")
+    priority = "high" if tier == "A" else "default"
     return title, body, priority
 
 
-def send_notification(title: str, body: str, priority: str):
+# ── ntfy sender ───────────────────────────────────────────────────────────────
+
+def send(title: str, body: str, priority: str, tags: str = "baseball"):
     try:
         resp = requests.post(
-            NTFY_URL,
-            data=body.encode("utf-8"),
-            headers={
-                "Title": title,
-                "Priority": priority,
-                "Tags": "baseball",
+            f"https://ntfy.sh/",
+            json={
+                "topic":    NTFY_TOPIC,
+                "title":    title,
+                "message":  body,
+                "priority": {"high": 4, "default": 3, "low": 2}.get(priority, 3),
+                "tags":     [tags],
             },
             timeout=10,
         )
@@ -166,22 +167,49 @@ def send_notification(title: str, body: str, priority: str):
         sys.exit(1)
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    hour = datetime.now().hour
-    if hour < 12:
-        run_label = "11am"
-    elif hour < 14:
-        run_label = "1pm"
-    else:
-        run_label = "3pm"
+    ts = datetime.now().strftime("%H:%M")
 
     cleared = clear_stale_cache()
-    print(f"[{datetime.now().strftime('%H:%M')}] {run_label} run — cleared {cleared} stale cache files")
+    print(f"[{ts}] Cleared {cleared} stale cache files")
 
-    print(f"Running model...")
-    run_model()
+    print(f"[{ts}] Running model...")
+    if not run_model():
+        print(f"[{ts}] Model failed — skipping notifications", file=sys.stderr)
+        sys.exit(1)
 
     data = load_picks()
-    title, body, priority = format_message(data, run_label)
-    print(f"Title: {title}")
-    send_notification(title, body, priority)
+    if not data:
+        print(f"[{ts}] No picks data — skipping", file=sys.stderr)
+        sys.exit(0)
+
+    picks    = data.get("picks", [])
+    notified = load_notified()
+
+    # Only care about Tier A/B with BOTH lineups confirmed
+    qualified = [
+        p for p in picks
+        if p["tier"] in ("A", "B")
+        and p["top_1st"].get("lineup_confirmed", False)
+        and p["bot_1st"].get("lineup_confirmed", False)
+    ]
+
+    newly_qualified = [
+        p for p in qualified
+        if str(p["game_pk"]) not in notified
+    ]
+
+    print(
+        f"[{ts}] {len(picks)} games scored · "
+        f"{len(qualified)} confirmed plays · "
+        f"{len(newly_qualified)} new to notify"
+    )
+
+    for pick in newly_qualified:
+        title, body, priority = format_pick(pick)
+        send(title, body, priority)
+        notified.add(str(pick["game_pk"]))
+
+    save_notified(notified)

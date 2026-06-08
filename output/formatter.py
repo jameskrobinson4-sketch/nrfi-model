@@ -128,6 +128,7 @@ def export_json(scores: list, game_date: date) -> Path:
     picks = []
     for gs in scores:
         picks.append({
+            "game_pk":         gs.game_pk,
             "game":            f"{gs.away_team}@{gs.home_team}",
             "time":            gs.game_time,
             "tier":            gs.tier,

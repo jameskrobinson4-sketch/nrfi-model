@@ -62,6 +62,8 @@ def score_game(game: dict, game_date: date,
     home_abbr = home.get("team", {}).get("abbreviation", "???")
     away_abbr = away.get("team", {}).get("abbreviation", "???")
 
+    home_team_id      = home.get("team", {}).get("id")
+    away_team_id      = away.get("team", {}).get("id")
     home_pitcher_data = home.get("probablePitcher", {})
     away_pitcher_data = away.get("probablePitcher", {})
     home_pitcher_id   = home_pitcher_data.get("id")
@@ -110,6 +112,7 @@ def score_game(game: dict, game_date: date,
         batting_team_side="away",
         pitcher_hand=home_pitcher_result.handedness,
         game_date=game_date,
+        team_id=away_team_id,
         end_date=end_date,
     )
 
@@ -137,6 +140,7 @@ def score_game(game: dict, game_date: date,
         batting_team_side="home",
         pitcher_hand=away_pitcher_result.handedness,
         game_date=game_date,
+        team_id=home_team_id,
         end_date=end_date,
     )
 

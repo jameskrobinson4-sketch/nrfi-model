@@ -1,5 +1,6 @@
 """All external HTTP calls. Swap data sources here only."""
 
+import time
 import requests
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -19,6 +20,18 @@ def _get(url: str, params: dict = None) -> dict:
     r = requests.get(url, params=params, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
+
+
+def _get_retrying(url: str, params: dict = None, retries: int = 2, delay: float = 3.0) -> dict:
+    for attempt in range(retries + 1):
+        try:
+            return _get(url, params)
+        except Exception as e:
+            if attempt < retries:
+                log.debug("Retry %d/%d for %s: %s", attempt + 1, retries, url, e)
+                time.sleep(delay)
+            else:
+                raise
 
 
 def fetch_schedule(game_date: date) -> list[dict]:
@@ -129,10 +142,19 @@ def fetch_lineup(game_pk: int, game_date: date) -> dict:
     key = f"lineup_{game_pk}"
     cached = _cache.get(key, game_date)
     if cached is not None:
-        return cached
+        # Don't serve a cached empty lineup — lineups may have posted since last fetch
+        teams = cached.get("teams", {})
+        away_order = teams.get("away", {}).get("battingOrder", [])
+        home_order = teams.get("home", {}).get("battingOrder", [])
+        if away_order or home_order:
+            return cached
     try:
         data = _get(f"{MLB_BASE}/game/{game_pk}/boxscore")
-        _cache.put(key, game_date, data)
+        teams = data.get("teams", {})
+        away_order = teams.get("away", {}).get("battingOrder", [])
+        home_order = teams.get("home", {}).get("battingOrder", [])
+        if away_order or home_order:
+            _cache.put(key, game_date, data)
         return data
     except Exception as e:
         log.warning("Lineup fetch failed pk=%d: %s", game_pk, e)
@@ -204,26 +226,44 @@ def fetch_batter_platoon_splits(batter_id: int, season: int,
 
 def fetch_umpire(game_pk: int, game_date: date) -> str:
     """
-    Fetch the home plate umpire name from the boxscore officials list.
+    Fetch the home plate umpire name.
+    Tries boxscore first (works after game starts), then schedule/officials (pre-game).
     Returns empty string if unavailable.
     """
     key = f"umpire_{game_pk}"
     cached = _cache.get(key, game_date)
     if cached is not None:
         return cached.get("name", "")
+
+    def _search_officials(officials: list) -> str:
+        for official in officials:
+            if official.get("officialType", "").lower() in ("home plate", "hp"):
+                return official.get("official", {}).get("fullName", "")
+        return ""
+
     try:
         data = _get(f"{MLB_BASE}/game/{game_pk}/boxscore")
-        officials = data.get("officials", [])
-        for official in officials:
-            if official.get("officialType", "").lower() == "home plate":
-                name = official.get("official", {}).get("fullName", "")
-                _cache.put(key, game_date, {"name": name})
-                return name
-        _cache.put(key, game_date, {"name": ""})
-        return ""
+        name = _search_officials(data.get("officials", []))
+        if name:
+            _cache.put(key, game_date, {"name": name})
+            return name
     except Exception as e:
-        log.debug("Umpire fetch failed pk=%d: %s", game_pk, e)
-        return ""
+        log.debug("Umpire boxscore fetch failed pk=%d: %s", game_pk, e)
+
+    # Pre-game fallback: schedule endpoint with officials hydration
+    try:
+        data = _get(f"{MLB_BASE}/schedule", {"gamePks": game_pk, "hydrate": "officials"})
+        for d in data.get("dates", []):
+            for g in d.get("games", []):
+                name = _search_officials(g.get("officials", []))
+                if name:
+                    _cache.put(key, game_date, {"name": name})
+                    return name
+    except Exception as e:
+        log.debug("Umpire schedule fallback failed pk=%d: %s", game_pk, e)
+
+    _cache.put(key, game_date, {"name": ""})
+    return ""
 
 
 def fetch_weather(lat: float, lon: float, game_date: date,
@@ -256,12 +296,43 @@ def fetch_weather(lat: float, lon: float, game_date: date,
     url = METEO_ARCHIVE if use_archive else config.OPEN_METEO_BASE
 
     try:
-        data = _get(url, base_params)
+        data = _get_retrying(url, base_params, retries=2, delay=3.0)
         _cache.put(key, game_date, data)
         return data
     except Exception as e:
         log.warning("Weather fetch failed (%s): %s", "archive" if use_archive else "forecast", e)
         return {}
+
+
+def fetch_team_roster(team_id: int, season: int, game_date: date) -> list[dict]:
+    """
+    Fetch the active roster for a team.
+    Returns list of player dicts: {id, fullName, position_code}.
+    Used as a fallback when battingOrder is not yet populated pre-game.
+    """
+    key = f"roster_{team_id}_{season}"
+    cached = _cache.get(key, game_date)
+    if cached is not None:
+        return cached
+    try:
+        data = _get(f"{MLB_BASE}/teams/{team_id}/roster", {
+            "rosterType": "active",
+            "season": season,
+        })
+        players = []
+        for entry in data.get("roster", []):
+            person = entry.get("person", {})
+            pos    = entry.get("position", {}).get("abbreviation", "")
+            players.append({
+                "id":            person.get("id"),
+                "fullName":      person.get("fullName", ""),
+                "position_code": pos,
+            })
+        _cache.put(key, game_date, players)
+        return players
+    except Exception as e:
+        log.warning("Roster fetch failed team_id=%d: %s", team_id, e)
+        return []
 
 
 def fetch_nrfi_odds(game_date: date) -> list[dict]:
