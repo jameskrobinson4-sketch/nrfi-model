@@ -24,11 +24,12 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "nrfi-3d5e5fc61cbd")
 NTFY_URL   = f"https://ntfy.sh/{NTFY_TOPIC}"
 MODEL_DIR  = Path(__file__).parent
 
-# Only notify when score is clearly above the tier threshold, not right at the edge.
-# Tier B threshold is 34%; we require 34.5% to avoid borderline false positives.
+# Tier thresholds — must match config.py TIER_A/B_THRESHOLD values × 100.
+# The game-time gate (GAME_CUTOFF_MINUTES) is the primary guard against false
+# notifications; no additional score buffer is needed here.
 TIER_A_THRESHOLD_PCT: float = 40.0
 TIER_B_THRESHOLD_PCT: float = 34.0
-NOTIFY_BUFFER_PCT:    float = 0.5
+NOTIFY_BUFFER_PCT:    float = 0.0
 
 # Don't send a notification within this many minutes of first pitch —
 # the bet window is effectively closed and the game may already be live.
