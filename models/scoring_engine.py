@@ -44,6 +44,7 @@ class GameScore:
     tier: str
     data_quality: str = "full"
     flags: list[str] = field(default_factory=list)
+    first_pitch_utc: Optional[str] = None
 
 
 def score_game(game: dict, game_date: date,
@@ -190,6 +191,7 @@ def score_game(game: dict, game_date: date,
         environment=env_result, raw_score=round(raw_score, 1),
         p_nrfi=p_nrfi, confidence_band=band, tier=tier,
         data_quality=overall_dq, flags=all_flags,
+        first_pitch_utc=game_dt_str,
     )
 
 

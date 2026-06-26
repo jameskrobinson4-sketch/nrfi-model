@@ -3,9 +3,10 @@
 Run NRFI model and push per-game ntfy notifications as lineups confirm.
 
 Runs hourly via GitHub Actions. Each run:
-  - Clears lineup/umpire cache so fresh data is fetched
+  - Clears lineup, umpire, AND schedule cache so probable pitchers are always fresh
   - Re-scores all games
-  - Sends one notification per newly qualifying game (Tier A/B, both lineups confirmed)
+  - Sends one notification per newly qualifying game (Tier A/B, both lineups
+    confirmed, score clearly above threshold, game not yet started)
   - Tracks already-notified game_pks in output/{date}_notified.json
   - Silent run if nothing new to report
 """
@@ -14,7 +15,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -23,15 +24,35 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "nrfi-3d5e5fc61cbd")
 NTFY_URL   = f"https://ntfy.sh/{NTFY_TOPIC}"
 MODEL_DIR  = Path(__file__).parent
 
+# Only notify when score is clearly above the tier threshold, not right at the edge.
+# Tier B threshold is 34%; we require 34.5% to avoid borderline false positives.
+TIER_A_THRESHOLD_PCT: float = 40.0
+TIER_B_THRESHOLD_PCT: float = 34.0
+NOTIFY_BUFFER_PCT:    float = 0.5
+
+# Don't send a notification within this many minutes of first pitch —
+# the bet window is effectively closed and the game may already be live.
+GAME_CUTOFF_MINUTES: int = 30
+
 
 # ── Cache helpers ─────────────────────────────────────────────────────────────
 
 def clear_stale_cache():
+    """
+    Delete lineup, umpire, and schedule cache files before each run.
+
+    Lineup and umpire: cleared so we always re-check whether lineups have
+    posted since the last hourly run.
+
+    Schedule: cleared so probable pitcher changes (late scratches) are always
+    picked up. Without this, a pitcher cached at 10am stays all day even if
+    the team makes a change at 3pm.
+    """
     cache_dir = MODEL_DIR / "data" / "cache" / str(date.today())
     if not cache_dir.exists():
         return 0
     cleared = 0
-    for pattern in ("lineup_*.json", "umpire_*.json"):
+    for pattern in ("lineup_*.json", "umpire_*.json", "schedule_*.json"):
         for f in cache_dir.glob(pattern):
             f.unlink()
             cleared += 1
@@ -74,10 +95,53 @@ def load_picks() -> dict:
     return json.loads(path.read_text())
 
 
+# ── Qualification checks ──────────────────────────────────────────────────────
+
+def _meets_notify_threshold(pick: dict) -> bool:
+    """Score must be clearly above tier threshold, not just at the edge."""
+    prob = pick["p_nrfi_pct"]
+    tier = pick["tier"]
+    if tier == "A":
+        return prob >= TIER_A_THRESHOLD_PCT + NOTIFY_BUFFER_PCT
+    if tier == "B":
+        return prob >= TIER_B_THRESHOLD_PCT + NOTIFY_BUFFER_PCT
+    return False
+
+
+def _game_still_open(pick: dict, ts: str) -> bool:
+    """
+    Return True if there is still time to place a bet before first pitch.
+    Returns False (and logs why) if the game starts within GAME_CUTOFF_MINUTES
+    or if first_pitch_utc is missing/unparseable.
+    """
+    fp_str = pick.get("first_pitch_utc", "")
+    game   = pick.get("game", "?")
+
+    if not fp_str:
+        print(f"[{ts}] SKIP {game} — no first_pitch_utc in picks JSON (old cache?)")
+        return False
+
+    try:
+        fp_dt   = datetime.fromisoformat(fp_str.replace("Z", "+00:00"))
+        utcnow  = datetime.now(timezone.utc)
+        cutoff  = fp_dt - timedelta(minutes=GAME_CUTOFF_MINUTES)
+        if utcnow >= cutoff:
+            mins_past = int((utcnow - fp_dt).total_seconds() / 60)
+            if utcnow >= fp_dt:
+                print(f"[{ts}] SKIP {game} — game already started ({mins_past}m ago)")
+            else:
+                mins_left = int((fp_dt - utcnow).total_seconds() / 60)
+                print(f"[{ts}] SKIP {game} — only {mins_left}m to first pitch, cutoff is {GAME_CUTOFF_MINUTES}m")
+            return False
+        return True
+    except (ValueError, TypeError) as e:
+        print(f"[{ts}] SKIP {game} — could not parse first_pitch_utc '{fp_str}': {e}")
+        return False
+
+
 # ── Notification formatting ───────────────────────────────────────────────────
 
 def _hitter_line(hitters: list, team: str) -> str:
-    """Compact last-name + OBP list: 'Torres .408 · McGonigle .398 · Dingler .346'"""
     parts = []
     for h in hitters[:3]:
         last = h["name"].split()[-1]
@@ -85,8 +149,7 @@ def _hitter_line(hitters: list, team: str) -> str:
     return f"{team}: " + " · ".join(parts)
 
 
-def _pitcher_line(half: dict, side_label: str, opp_team: str) -> str:
-    """'▲ TOP  Keider Montero (RHP)  60/100 · 66 IP  →  61% scoreless'"""
+def _pitcher_line(half: dict, side_label: str) -> str:
     pc   = half["pitcher_components"]
     ip   = pc.get("ip", 0)
     hand = half["pitcher_hand"]
@@ -110,8 +173,8 @@ def format_pick(pick: dict) -> tuple[str, str, str]:
     env   = pick["environment"]["components"]
 
     away, home = game.split("@")
-    stake      = "2u" if tier == "A" else "1u"
-    icon       = "★" if tier == "A" else "▸"
+    stake = "2u" if tier == "A" else "1u"
+    icon  = "★" if tier == "A" else "▸"
 
     title = f"{icon} NRFI Tier {tier} ({stake}) — {game}  {time}"
 
@@ -128,10 +191,10 @@ def format_pick(pick: dict) -> tuple[str, str, str]:
     lines = [
         f"P(NRFI): {prob}%  ±{band}%  [raw {raw:.0f}/100]",
         "",
-        _pitcher_line(top, "▲ TOP", away),
+        _pitcher_line(top, "▲ TOP"),
         f"  {_hitter_line(top.get('hitters', []), away)}",
         "",
-        _pitcher_line(bot, "▼ BOT", home),
+        _pitcher_line(bot, "▼ BOT"),
         f"  {_hitter_line(bot.get('hitters', []), home)}",
         "",
         f"Park {env.get('park', 50):.0f}  ·  Wx {env.get('weather', 50):.0f}  ·  Ump {ump_str}",
@@ -150,7 +213,7 @@ def format_pick(pick: dict) -> tuple[str, str, str]:
 def send(title: str, body: str, priority: str, tags: str = "baseball"):
     try:
         resp = requests.post(
-            f"https://ntfy.sh/",
+            "https://ntfy.sh/",
             json={
                 "topic":    NTFY_TOPIC,
                 "title":    title,
@@ -173,7 +236,7 @@ if __name__ == "__main__":
     ts = datetime.now().strftime("%H:%M")
 
     cleared = clear_stale_cache()
-    print(f"[{ts}] Cleared {cleared} stale cache files")
+    print(f"[{ts}] Cleared {cleared} stale cache files (lineup + umpire + schedule)")
 
     print(f"[{ts}] Running model...")
     if not run_model():
@@ -188,26 +251,48 @@ if __name__ == "__main__":
     picks    = data.get("picks", [])
     notified = load_notified()
 
-    # Only care about Tier A/B with BOTH lineups confirmed
-    qualified = [
+    # Step 1: both lineups confirmed
+    lineup_confirmed = [
         p for p in picks
-        if p["tier"] in ("A", "B")
-        and p["top_1st"].get("lineup_confirmed", False)
+        if p["top_1st"].get("lineup_confirmed", False)
         and p["bot_1st"].get("lineup_confirmed", False)
     ]
 
-    newly_qualified = [
-        p for p in qualified
-        if str(p["game_pk"]) not in notified
-    ]
+    # Step 2: tier A or B AND score is clearly above threshold (not right at boundary)
+    above_threshold = [p for p in lineup_confirmed if _meets_notify_threshold(p)]
+
+    # Step 3: not already sent
+    not_yet_notified = [p for p in above_threshold if str(p["game_pk"]) not in notified]
+
+    # Step 4: game hasn't started yet (gate against post-game notifications)
+    sendable = [p for p in not_yet_notified if _game_still_open(p, ts)]
 
     print(
-        f"[{ts}] {len(picks)} games scored · "
-        f"{len(qualified)} confirmed plays · "
-        f"{len(newly_qualified)} new to notify"
+        f"[{ts}] {len(picks)} games scored  ·  "
+        f"{len(lineup_confirmed)} lineups confirmed  ·  "
+        f"{len(above_threshold)} above threshold  ·  "
+        f"{len(not_yet_notified)} not yet notified  ·  "
+        f"{len(sendable)} to send now"
     )
 
-    for pick in newly_qualified:
+    # Log anything confirmed + above threshold but already notified (informational)
+    already_sent = [p for p in above_threshold if str(p["game_pk"]) in notified]
+    for p in already_sent:
+        print(f"[{ts}] already notified: {p['game']} {p['p_nrfi_pct']}%")
+
+    # Log anything confirmed + tier-qualifying but below the buffer threshold
+    borderline = [
+        p for p in lineup_confirmed
+        if p["tier"] in ("A", "B") and not _meets_notify_threshold(p)
+    ]
+    for p in borderline:
+        tier_floor = TIER_A_THRESHOLD_PCT if p["tier"] == "A" else TIER_B_THRESHOLD_PCT
+        print(
+            f"[{ts}] borderline {p['game']} {p['p_nrfi_pct']}% "
+            f"(Tier {p['tier']} floor {tier_floor}%, buffer +{NOTIFY_BUFFER_PCT}%)"
+        )
+
+    for pick in sendable:
         title, body, priority = format_pick(pick)
         send(title, body, priority)
         notified.add(str(pick["game_pk"]))

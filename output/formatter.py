@@ -161,6 +161,7 @@ def export_json(scores: list, game_date: date) -> Path:
             },
             "flags":           gs.flags,
             "data_quality":    gs.data_quality,
+            "first_pitch_utc": gs.first_pitch_utc,
         })
 
     path.write_text(json.dumps({"date": str(game_date), "picks": picks}, indent=2))
