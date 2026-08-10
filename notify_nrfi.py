@@ -5,8 +5,8 @@ Run NRFI model and push per-game ntfy notifications as lineups confirm.
 Runs hourly via GitHub Actions. Each run:
   - Clears lineup, umpire, AND schedule cache so probable pitchers are always fresh
   - Re-scores all games
-  - Sends one notification per newly qualifying game (Tier A/B, both lineups
-    confirmed, score clearly above threshold, game not yet started)
+  - Sends one notification per newly qualifying game (Tier A/B, at least one
+    lineup confirmed, score above threshold, game not yet started)
   - Tracks already-notified game_pks in output/{date}_notified.json
   - Silent run if nothing new to report
 """
@@ -112,23 +112,27 @@ def _meets_notify_threshold(pick: dict) -> bool:
 def _game_still_open(pick: dict, ts: str) -> bool:
     """
     Return True if there is still time to place a bet before first pitch.
-    Returns False (and logs why) if the game starts within GAME_CUTOFF_MINUTES
-    or if first_pitch_utc is missing/unparseable.
+
+    When first_pitch_utc is missing or unparseable we allow the notification
+    rather than silently dropping a qualifying pick — lineup confirmation is
+    already the primary gate.
     """
     fp_str = pick.get("first_pitch_utc", "")
     game   = pick.get("game", "?")
 
     if not fp_str:
-        print(f"[{ts}] SKIP {game} — no first_pitch_utc in picks JSON (old cache?)")
-        return False
+        # Unknown start time — don't block a qualifying pick just because the
+        # schedule didn't return a game time (happens on rescheduled/makeup games).
+        print(f"[{ts}] WARN {game} — no first_pitch_utc, sending anyway")
+        return True
 
     try:
         fp_dt   = datetime.fromisoformat(fp_str.replace("Z", "+00:00"))
         utcnow  = datetime.now(timezone.utc)
         cutoff  = fp_dt - timedelta(minutes=GAME_CUTOFF_MINUTES)
         if utcnow >= cutoff:
-            mins_past = int((utcnow - fp_dt).total_seconds() / 60)
             if utcnow >= fp_dt:
+                mins_past = int((utcnow - fp_dt).total_seconds() / 60)
                 print(f"[{ts}] SKIP {game} — game already started ({mins_past}m ago)")
             else:
                 mins_left = int((fp_dt - utcnow).total_seconds() / 60)
@@ -136,8 +140,9 @@ def _game_still_open(pick: dict, ts: str) -> bool:
             return False
         return True
     except (ValueError, TypeError) as e:
-        print(f"[{ts}] SKIP {game} — could not parse first_pitch_utc '{fp_str}': {e}")
-        return False
+        # Unparseable time — treat the same as missing: allow through
+        print(f"[{ts}] WARN {game} — could not parse first_pitch_utc '{fp_str}' ({e}), sending anyway")
+        return True
 
 
 # ── Notification formatting ───────────────────────────────────────────────────
@@ -202,7 +207,14 @@ def format_pick(pick: dict) -> tuple[str, str, str]:
     ]
     if wx_flag:
         lines.append(f"🌡 {wx_flag}")
-    lines.append("✅ Lineups confirmed")
+    top_lc = pick["top_1st"].get("lineup_confirmed", False)
+    bot_lc = pick["bot_1st"].get("lineup_confirmed", False)
+    if top_lc and bot_lc:
+        lines.append("✅ Both lineups confirmed")
+    elif top_lc:
+        lines.append(f"⚠️ {away} lineup confirmed — {home} lineup pending")
+    else:
+        lines.append(f"⚠️ {home} lineup confirmed — {away} lineup pending")
 
     body     = "\n".join(lines)
     priority = "high" if tier == "A" else "default"
@@ -252,11 +264,12 @@ if __name__ == "__main__":
     picks    = data.get("picks", [])
     notified = load_notified()
 
-    # Step 1: both lineups confirmed
+    # Step 1: at least one lineup confirmed (requiring BOTH misses picks where one
+    # team posts early; the model already degrades gracefully on unconfirmed halves)
     lineup_confirmed = [
         p for p in picks
         if p["top_1st"].get("lineup_confirmed", False)
-        and p["bot_1st"].get("lineup_confirmed", False)
+        or p["bot_1st"].get("lineup_confirmed", False)
     ]
 
     # Step 2: tier A or B AND score is clearly above threshold (not right at boundary)
